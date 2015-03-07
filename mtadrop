@@ -1,0 +1,216 @@
+#!/usr/bin/env php
+<?php
+
+namespace MTADrop;
+
+use \Exception;
+
+class Client {
+
+    const OK = 250;
+    const READY = 220;
+    const CLOSE = 221;
+    const INPUT = 354;
+
+    public $server;
+
+    protected $socket;
+    protected $mail;
+
+    public function __construct($server) {
+        $this->server = $server;
+    }
+
+    public function send($mail) {
+        $this->mail = $mail;
+        if (!$this->connect()) {
+            return false;
+        }
+        $commands = $this->getCommands($mail);
+        try {
+            foreach ($commands as $cmd) {
+                if (is_int($cmd)) {
+                    $this->wait($cmd);
+                } else {
+                    $this->write($cmd);
+                }
+            }
+        } catch (Exception $exc) {
+            echo $exc->getMessage();
+            return false;
+        }
+
+        $this->close();
+
+        return true;
+    }
+
+    function getCommands($mail) {
+        $nl = "\r\n";
+        return [
+            "EHLO {$this->server}",
+            self::OK,
+            "MAIL FROM:{$mail->from}",
+            self::OK,
+            "RCPT TO:{$mail->to}",
+            self::OK,
+            "DATA",
+            self::INPUT,
+            "From: {$mail->from}{$nl}To: {$mail->to}{$nl}Subject: {$mail->subject}{$nl}",
+            "{$mail->message}{$nl}",
+            ".",
+            self::OK,
+            "QUIT",
+            self::CLOSE,
+        ];
+    }
+
+    function connect($port = 25) {
+        echo 'Connecting...' . PHP_EOL;
+        $this->socket = fsockopen($this->server, $port, $errno, $errstr, 15);
+        if (!$this->socket) {
+            echo "Could not connect to smtp host $this->server ($errno): $errstr";
+            return false;
+        }
+        $this->wait(self::READY);
+        return true;
+    }
+
+    function close() {
+        fclose($this->socket);
+    }
+
+    function wait($until = self::OK) {
+        $pattern = "/^$until .*/";
+        $response = null;
+        while (!preg_match($pattern, $response)) {
+            $response = $this->read();
+            if($response) {
+                $code = intval(substr($response, 0, 3));
+                if($code >= 400) {
+                    throw new Exception("Unexpected response: $response\n");
+                }
+            } else {
+                throw new Exception('Unexpected end of input');
+            }
+        }
+    }
+
+    function read($length = 256) {
+        $data = fgets($this->socket, $length);
+        echo "[server]\n{$data}\n";
+        return $data;
+    }
+
+    function write($data) {
+        $length = fwrite($this->socket, "$data\r\n");
+        echo "[client]\n{$data}\n";
+        return $length;
+    }
+
+}
+
+class Mail {
+
+    public $to;
+    public $from = '<mtadrop@example.com>';
+    public $subject = 'To infinity...';
+    public $message = '...and beyond!';
+
+    public function send() {
+        $this->normalize();
+        $mxRecords = $this->getMxRecords();
+        $n = count($mxRecords);
+        foreach ($mxRecords as $i => $server) {
+            $j = $i + 1;
+            echo "Attempting server $j/$n ($server)\n";
+            $client = new Client($server);
+            if ($client->send($this)) {
+                echo "Sent!\r\n";
+                return true;
+            }
+        }
+        echo "Unable to send the mail\n";
+    }
+
+    function normalize() {
+        foreach (['from', 'to'] as $var) {
+            $val = $this->{$var};
+            if (!preg_match('/^.*<.+>$/', $val)) {
+                $this->{$var} = "<$val>";
+            }
+        }
+    }
+
+    function getMxRecords() {
+        $regex = '/@(((([^.]+)\.)+)([a-zA-Z]{3,}|[a-zA-Z.]{5,}))/';
+        if (!preg_match($regex, $this->to, $matches)) {
+            throw new Exception('Unable to find the domain of the recipient');
+        }
+        $domain = $matches[1];
+
+        if (!getmxrr($domain, $mxhosts, $weight)) {
+            throw new Exception('Unable to resolve MX records');
+        }
+        asort($weight);
+
+        $records = [];
+        foreach (array_keys($weight) as $i) {
+            $records[] = $mxhosts[$i];
+        }
+        echo count($records) . " MX Record/s found\n";
+        return $records;
+    }
+
+}
+
+class Application {
+
+    public function run() {
+        $mail = new Mail();
+        $this->getopt($mail);
+        $mail->send();
+    }
+
+    function getopt($mail) {
+        $options = getopt('hf::m::');
+        foreach ($options as $opt => $value) {
+            switch ($opt) {
+                case 'f':
+                    $mail->from = $value;
+                    break;
+                case 'm':
+                    $mail->message = $value;
+                    break;
+                case 'h':
+                default:
+                    $this->help();
+            }
+        }
+
+        global $argv;
+        $args = array_slice($argv, 1 + count($options));
+        $nargs = count($args);
+
+        switch ($nargs) {
+            case 2:
+                $mail->subject = $args[1];
+            case 1:
+                $mail->to = $args[0];
+                break;
+            default:
+                $this->help();
+        }
+
+    }
+
+    function help() {
+        echo "usage: mtadrop [-fSENDER] [-mMESSAGE] RECIPIENT [SUBJECT]\n";
+        exit;
+    }
+
+}
+
+if (count(debug_backtrace()) == 0) {
+    (new Application())->run();
+}
